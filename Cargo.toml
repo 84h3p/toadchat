@@ -11,4 +11,10 @@ egui-wgpu = { version = "0.31.1", default-features = false, features = ["winit"]
 rfd = "0.15"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 wgpu = { version = "24", default-features = false, features = ["wgsl"] }
-xmpp = "0.7"
+ xmpp = { version = "0.7", features = ["escape-hatch"] }
+dziber-omemo = "=0.0.3"
+minidom_legacy = { package = "minidom", version = "0.18" }
+keyring = { version = "3", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rand = "0.9"
+sha2 = "0.10"

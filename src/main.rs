@@ -1,5 +1,8 @@
 mod transport;
+mod omemo_protocol;
+mod omemo_store;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -19,6 +22,15 @@ struct ChatMessage {
     time: String,
     outgoing: bool,
     attachment: bool,
+    encrypted: bool,
+}
+
+#[derive(Clone)]
+struct OmemoDeviceInfo {
+    jid: String,
+    device_id: u32,
+    fingerprint: String,
+    trust: transport::DeviceTrust,
 }
 
 #[derive(Clone)]
@@ -55,6 +67,10 @@ struct ToadchatApp {
     show_new_chat: bool,
     new_chat_jid: String,
     demo_mode: bool,
+    encrypted_chats: HashSet<String>,
+    pending_uploads: HashSet<String>,
+    omemo_devices: Vec<OmemoDeviceInfo>,
+    omemo_status: String,
     command_tx: Option<tokio::sync::mpsc::UnboundedSender<ClientCommand>>,
     event_rx: Receiver<ClientEvent>,
     event_tx: Sender<ClientEvent>,
@@ -80,6 +96,10 @@ impl Default for ToadchatApp {
             show_new_chat: false,
             new_chat_jid: String::new(),
             demo_mode: false,
+            encrypted_chats: HashSet::new(),
+            pending_uploads: HashSet::new(),
+            omemo_devices: Vec::new(),
+            omemo_status: "OMEMO выключено".to_owned(),
             command_tx: None,
             event_rx,
             event_tx,
@@ -118,24 +138,29 @@ impl ToadchatApp {
                 time: "Сейчас".to_owned(),
                 outgoing: true,
                 attachment: false,
+                encrypted: false,
             });
             chat.preview = body;
             chat.time = "Сейчас".to_owned();
             self.draft.clear();
         } else if let Some(tx) = &self.command_tx {
             let recipient = self.contacts[self.selected].jid.clone();
-            match tx.send(ClientCommand::SendMessage { recipient, body: body.clone() }) {
+            let encrypted = self.encrypted_chats.contains(&recipient);
+            match tx.send(ClientCommand::SendMessage { recipient, body: body.clone(), encrypted }) {
                 Ok(()) => {
-                    let chat = &mut self.contacts[self.selected];
-                    chat.messages.push(ChatMessage {
-                        body: body.clone(),
-                        time: "Сейчас".to_owned(),
-                        outgoing: true,
-                        attachment: false,
-                    });
-                    chat.preview = body;
-                    chat.time = "Сейчас".to_owned();
-                    self.draft.clear();
+                    if !encrypted {
+                        let chat = &mut self.contacts[self.selected];
+                        chat.messages.push(ChatMessage {
+                            body: body.clone(),
+                            time: "Сейчас".to_owned(),
+                            outgoing: true,
+                            attachment: false,
+                            encrypted: false,
+                        });
+                        chat.preview = body;
+                        chat.time = "Сейчас".to_owned();
+                        self.draft.clear();
+                    }
                 }
                 Err(_) => self.toast = Some(("Соединение потеряно".to_owned(), 3.0)),
             }
@@ -143,6 +168,10 @@ impl ToadchatApp {
     }
 
     fn choose_attachment(&mut self) {
+        if self.selected < self.contacts.len() && self.encrypted_chats.contains(&self.contacts[self.selected].jid) {
+            self.toast = Some(("Файлы legacy OMEMO не реализованы. Отключите OMEMO, чтобы загрузить файл (ссылка будет доступна серверу upload).".to_owned(), 6.0));
+            return;
+        }
         if !self.demo_mode && !self.is_online {
             self.toast = Some(("Сначала подключитесь к XMPP".to_owned(), 3.0));
             return;
@@ -165,6 +194,7 @@ impl ToadchatApp {
                 time: "Сейчас".to_owned(),
                 outgoing: true,
                 attachment: true,
+                encrypted: false,
             });
             self.toast = Some(("Демо: файл не загружался".to_owned(), 3.0));
             return;
@@ -173,7 +203,10 @@ impl ToadchatApp {
             let recipient = self.contacts[self.selected].jid.clone();
             let service = self.upload_service.trim().to_owned();
             match tx.send(ClientCommand::UploadFile { recipient, service, path }) {
-                Ok(()) => self.toast = Some((format!("Загружаем {name}…"), 3.0)),
+                Ok(()) => {
+                    self.pending_uploads.insert(self.contacts[self.selected].jid.clone());
+                    self.toast = Some((format!("Загружаем {name}…"), 3.0));
+                }
                 Err(_) => self.toast = Some(("Не удалось начать загрузку".to_owned(), 3.0)),
             }
         }
@@ -195,7 +228,7 @@ impl ToadchatApp {
                     self.status = "Нет соединения".to_owned();
                     self.toast = Some((reason, 5.0));
                 }
-                ClientEvent::Message { sender, body } => {
+                ClientEvent::Message { sender, body, encrypted } => {
                     let index = self.contacts.iter().position(|c| c.jid == sender).unwrap_or_else(|| {
                         self.contacts.push(Contact {
                             name: sender.split('@').next().unwrap_or(&sender).to_owned(),
@@ -219,7 +252,24 @@ impl ToadchatApp {
                         time: "Сейчас".to_owned(),
                         outgoing: false,
                         attachment: false,
+                        encrypted,
                     });
+                    ctx.request_repaint();
+                }
+                ClientEvent::Sent { recipient, body, encrypted } => {
+                    if let Some(index) = self.contacts.iter().position(|contact| contact.jid == recipient) {
+                        let chat = &mut self.contacts[index];
+                        chat.preview = body.clone();
+                        chat.time = "Сейчас".to_owned();
+                        chat.messages.push(ChatMessage {
+                            body: body.clone(),
+                            time: "Сейчас".to_owned(),
+                            outgoing: true,
+                            attachment: false,
+                            encrypted,
+                        });
+                        if self.selected == index && self.draft == body { self.draft.clear(); }
+                    }
                     ctx.request_repaint();
                 }
                 ClientEvent::Contact { jid, name } => {
@@ -244,8 +294,9 @@ impl ToadchatApp {
                     self.selected = self.selected.min(self.contacts.len().saturating_sub(1));
                 }
                 ClientEvent::UploadComplete { recipient, url, file_name } => {
+                    self.pending_uploads.remove(&recipient);
                     if let Some(tx) = &self.command_tx {
-                        let _ = tx.send(ClientCommand::SendMessage { recipient: recipient.clone(), body: url.clone() });
+                        let _ = tx.send(ClientCommand::SendMessage { recipient: recipient.clone(), body: url.clone(), encrypted: false });
                     }
                     if let Some(index) = self.contacts.iter().position(|c| c.jid == recipient) {
                         self.contacts[index].messages.push(ChatMessage {
@@ -253,10 +304,29 @@ impl ToadchatApp {
                             time: "Сейчас".to_owned(),
                             outgoing: true,
                             attachment: true,
+                            encrypted: false,
                         });
-                        self.contacts[index].preview = format!("📎 {file_name}");
+                        self.contacts[index].preview = format!("Файл: {file_name}");
                     }
                     self.toast = Some((format!("Файл загружен: {file_name}"), 4.0));
+                }
+                ClientEvent::OmemoReady { device_id } => {
+                    self.omemo_status = format!("Legacy OMEMO · устройство {device_id}");
+                }
+                ClientEvent::OmemoUnavailable(reason) => {
+                    self.omemo_status = "OMEMO storage недоступно".to_owned();
+                    self.toast = Some((reason, 6.0));
+                }
+                ClientEvent::OmemoDevice { jid, device_id, fingerprint, trust } => {
+                    if let Some(device) = self.omemo_devices.iter_mut().find(|device| device.jid == jid && device.device_id == device_id) {
+                        device.fingerprint = fingerprint;
+                        device.trust = trust;
+                    } else {
+                        self.omemo_devices.push(OmemoDeviceInfo { jid, device_id, fingerprint, trust });
+                    }
+                }
+                ClientEvent::OmemoBlocked { sender, reason } => {
+                    self.toast = Some((format!("Зашифрованное сообщение от {sender}: {reason}"), 6.0));
                 }
                 ClientEvent::Info(message) => self.toast = Some((message, 4.0)),
             }
@@ -306,14 +376,17 @@ impl ToadchatApp {
                 logo(ui, 31.0);
                 ui.label(RichText::new("Toadchat").size(20.0).strong().color(TEXT));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(egui::Button::new(RichText::new("⚙").size(19.0).color(MUTED)).frame(false)).clicked() { self.show_settings = !self.show_settings; }
-                    if ui.add(egui::Button::new(RichText::new("＋").size(22.0).color(BLUE)).frame(false)).clicked() { self.show_new_chat = true; }
+                    if icon_button(ui, Icon::Settings, 34.0, MUTED, "Настройки").clicked() { self.show_settings = !self.show_settings; }
+                    if icon_button(ui, Icon::Plus, 34.0, BLUE, "Новый разговор").clicked() { self.show_new_chat = true; }
                 });
             });
             ui.add_space(24.0);
             ui.label(RichText::new("СООБЩЕНИЯ").size(11.0).strong().color(MUTED));
             ui.add_space(10.0);
-            ui.add_sized([ui.available_width(), 38.0], egui::TextEdit::singleline(&mut self.search).hint_text("⌕  Поиск чатов"));
+            ui.horizontal(|ui| {
+                draw_icon(ui, Icon::Search, 16.0, MUTED);
+                ui.add_sized([ui.available_width(), 38.0], egui::TextEdit::singleline(&mut self.search).hint_text("Поиск чатов"));
+            });
             ui.add_space(14.0);
 
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -352,8 +425,8 @@ impl ToadchatApp {
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let dot = if self.is_online { Color32::from_rgb(47, 190, 122) } else { MUTED };
-                    ui.colored_label(dot, "●");
+                        let dot = if self.is_online { Color32::from_rgb(47, 190, 122) } else { MUTED };
+                        status_dot(ui, dot);
                     ui.label(RichText::new(if self.demo_mode { "Демо-режим" } else { &self.status }).size(12.0).color(MUTED));
                 });
             });
@@ -369,7 +442,7 @@ impl ToadchatApp {
                     ui.add_space(6.0);
                     ui.label(RichText::new("Добавьте человека по его XMPP-адресу.").size(14.0).color(MUTED));
                     ui.add_space(18.0);
-                    if ui.add(egui::Button::new(RichText::new("＋  Новый разговор").strong().color(Color32::WHITE)).fill(BLUE).corner_radius(12)).clicked() { self.show_new_chat = true; }
+                    if ui.add(egui::Button::new(RichText::new("Новый разговор").strong().color(Color32::WHITE)).fill(BLUE).corner_radius(12)).clicked() { self.show_new_chat = true; }
                 });
             });
             self.draw_dialogs(ctx);
@@ -380,6 +453,8 @@ impl ToadchatApp {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(0))).show(ctx, |ui| {
             if self.contacts.is_empty() { return; }
             let contact = &self.contacts[self.selected];
+            let contact_jid = contact.jid.clone();
+            let omemo_enabled = self.encrypted_chats.contains(&contact_jid);
             egui::TopBottomPanel::top("chat_header").frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 16 }).stroke(Stroke::new(1.0_f32, LINE))).show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     avatar(ui, &contact.name, contact.color, 42.0, contact.online);
@@ -389,12 +464,34 @@ impl ToadchatApp {
                         ui.label(RichText::new(if contact.online { "В сети" } else { &contact.jid }).size(12.0).color(MUTED));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        small_icon_button(ui, "⋯", "Дополнительные действия");
-                        let call = ui.add_enabled(false, egui::Button::new(RichText::new("▣").size(17.0).color(MUTED)).corner_radius(10));
+                        small_icon_button(ui, Icon::More, "Дополнительные действия");
+                        let call = icon_button_enabled(ui, Icon::Video, 36.0, MUTED, false, "Видеозвонки пока не подключены");
                         call.on_hover_text("Звонки по XMPP Jingle пока не подключены");
-                        let audio = ui.add_enabled(false, egui::Button::new(RichText::new("☎").size(17.0).color(MUTED)).corner_radius(10));
+                        let audio = icon_button_enabled(ui, Icon::Phone, 36.0, MUTED, false, "Аудиозвонки пока не подключены");
                         audio.on_hover_text("Аудиозвонки пока не подключены");
-                        if ui.add(egui::Button::new(RichText::new("🔒  TLS").size(12.0).color(Color32::from_rgb(38, 135, 95))).corner_radius(10)).clicked() { self.show_security = true; }
+                        let color = if omemo_enabled { Color32::from_rgb(38, 135, 95) } else { MUTED };
+                        let can_toggle_omemo = self.is_online && !self.demo_mode
+                            && !contact_jid.contains("@conference.") && !contact_jid.contains("@muc.")
+                            && !self.pending_uploads.contains(&contact_jid);
+                        let label = if omemo_enabled { "Legacy OMEMO" } else { "TLS only" };
+                        let lock = if omemo_enabled { Icon::Lock } else { Icon::Unlock };
+                        let mut toggle_omemo = false;
+                        ui.horizontal(|ui| {
+                            draw_icon(ui, lock, 15.0, color);
+                            let mut button = ui.add_enabled(can_toggle_omemo, egui::Button::new(RichText::new(label).size(12.0).color(color)).corner_radius(10));
+                            if !can_toggle_omemo && (contact_jid.contains("@conference.") || contact_jid.contains("@muc.")) { button = button.on_hover_text("Экспериментальный legacy OMEMO поддерживает только личные чаты"); }
+                            if !can_toggle_omemo && self.pending_uploads.contains(&contact_jid) { button = button.on_hover_text("Дождитесь завершения загрузки: XEP-0363 не шифрует файл"); }
+                            toggle_omemo = button.clicked();
+                        });
+                        if toggle_omemo {
+                            if omemo_enabled {
+                                self.encrypted_chats.remove(&contact_jid);
+                            } else {
+                                self.encrypted_chats.insert(contact_jid.clone());
+                                if let Some(tx) = &self.command_tx { let _ = tx.send(ClientCommand::FetchDevices { jid: contact_jid.clone() }); }
+                            }
+                            self.show_security = true;
+                        }
                     });
                 });
             });
@@ -414,9 +511,23 @@ impl ToadchatApp {
                             egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(16)).stroke(Stroke::new(1.0_f32, if message.outgoing { Color32::from_rgb(220, 232, 251) } else { LINE })).inner_margin(egui::Margin { left: 14, right: 14, top: 10, bottom: 8 }).show(ui, |ui| {
                                 ui.set_max_width(460.0);
                                 if message.attachment {
-                                    ui.label(RichText::new(format!("📎  {}", message.body)).size(14.0).color(TEXT));
+                                    ui.horizontal(|ui| {
+                                        draw_icon(ui, Icon::Paperclip, 16.0, MUTED);
+                                        ui.label(RichText::new(&message.body).size(14.0).color(TEXT));
+                                    });
                                 } else {
                                     ui.label(RichText::new(&message.body).size(14.0).color(TEXT));
+                                }
+                                if message.encrypted {
+                                    ui.horizontal(|ui| {
+                                        draw_icon(ui, Icon::Lock, 13.0, Color32::from_rgb(38, 135, 95));
+                                        ui.label(RichText::new("Legacy OMEMO").size(10.0).color(Color32::from_rgb(38, 135, 95)));
+                                    });
+                                } else if omemo_enabled {
+                                    ui.horizontal(|ui| {
+                                        draw_icon(ui, Icon::Warning, 13.0, Color32::from_rgb(190, 110, 30));
+                                        ui.label(RichText::new("Не зашифровано OMEMO").size(10.0).color(Color32::from_rgb(190, 110, 30)));
+                                    });
                                 }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(&message.time).size(10.0).color(MUTED)));
                             });
@@ -430,17 +541,18 @@ impl ToadchatApp {
             egui::TopBottomPanel::bottom("composer").frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin { left: 24, right: 24, top: 8, bottom: 18 })).show_inside(ui, |ui| {
                 egui::Frame::new().fill(PANEL).corner_radius(CornerRadius::same(20)).stroke(Stroke::new(1.0_f32, LINE)).inner_margin(egui::Margin::same(9)).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let attach = ui.add(egui::Button::new(RichText::new("＋").size(22.0).color(MUTED)).corner_radius(12));
+                        let attach = icon_button(ui, Icon::Paperclip, 38.0, MUTED, "Прикрепить файл");
                         if attach.clicked() { self.choose_attachment(); }
                         let response = ui.add_sized([ui.available_width() - 100.0, 40.0], egui::TextEdit::singleline(&mut self.draft).hint_text("Написать сообщение…").frame(false));
                         let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        let send = ui.add_enabled(self.is_online || self.demo_mode, egui::Button::new(RichText::new("➤").size(17.0).color(Color32::WHITE)).fill(BLUE).corner_radius(12));
+                        let send = send_button(ui, self.is_online || self.demo_mode);
                         if send.clicked() || (enter && (self.is_online || self.demo_mode)) { self.send_draft(); }
                     });
                 });
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Сообщения защищены TLS при передаче").size(11.0).color(MUTED));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new("OMEMO: не подключено").size(11.0).color(MUTED)));
+                    let encrypted = self.encrypted_chats.contains(&self.contacts[self.selected].jid);
+                    ui.label(RichText::new(if encrypted { "Legacy OMEMO · TLS защищает транспорт" } else { "Только TLS до сервера · OMEMO выключено" }).size(11.0).color(MUTED));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(&self.omemo_status).size(11.0).color(MUTED)));
                 });
             });
         });
@@ -500,13 +612,37 @@ impl ToadchatApp {
             });
         }
         if self.show_security {
+            let selected_jid = self.contacts.get(self.selected).map(|contact| contact.jid.clone()).unwrap_or_default();
+            let devices: Vec<_> = self.omemo_devices.iter().filter(|device| device.jid == selected_jid).cloned().collect();
             egui::Window::new("Безопасность соединения").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
                 ui.set_width(360.0);
-                ui.label(RichText::new("TLS включён").size(17.0).strong().color(Color32::from_rgb(38, 135, 95)));
+                ui.label(RichText::new("Экспериментальный legacy OMEMO").size(17.0).strong().color(Color32::from_rgb(38, 135, 95)));
                 ui.add_space(8.0);
-                ui.label("TLS защищает канал между приложением и XMPP-сервером. Это не сквозное шифрование: сервер технически может иметь доступ к содержимому сообщений.");
+                ui.label("Используется старый Conversations wire protocol (eu.siacs.conversations.axolotl) через dziber-omemo 0.0.3; это не современный namespace XEP-0384 OMEMO 2. Совместимость есть только с клиентами, поддерживающими этот legacy-вариант. Реализация экспериментальная и не проходила независимый аудит. Сверьте fingerprint каждого устройства с собеседником по независимому каналу.");
                 ui.add_space(8.0);
-                ui.label(RichText::new("OMEMO / сквозное шифрование пока не реализовано.").strong().color(TEXT));
+                ui.label(RichText::new("Для зашифрованной отправки должны быть проверены все устройства собеседника. Если ключи не готовы или сообщение не шифруется, оно не отправляется открытым текстом.").strong().color(TEXT));
+                if devices.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(format!("Устройства для {selected_jid} пока не получены. Включите OMEMO в заголовке чата, чтобы запросить список.")).size(12.0).color(MUTED));
+                }
+                for device in devices {
+                    ui.separator();
+                    ui.label(RichText::new(format!("{} · устройство {}", device.jid, device.device_id)).strong());
+                    ui.label(RichText::new(&device.fingerprint).monospace().size(11.0));
+                    let trust_label = match device.trust {
+                        transport::DeviceTrust::Trusted => "Доверено",
+                        transport::DeviceTrust::Untrusted => "Отклонено",
+                        transport::DeviceTrust::Undecided => "Не проверено",
+                    };
+                    ui.label(RichText::new(format!("Статус: {trust_label}")).size(11.0).color(MUTED));
+                    if device.trust != transport::DeviceTrust::Trusted
+                        && ui.button("Сверил fingerprint — доверять").clicked()
+                    {
+                        if let Some(tx) = &self.command_tx {
+                            let _ = tx.send(ClientCommand::TrustDevice { jid: device.jid.clone(), device_id: device.device_id });
+                        }
+                    }
+                }
                 ui.add_space(12.0);
                 if ui.button("Понятно").clicked() { self.show_security = false; }
             });
@@ -563,24 +699,24 @@ fn main() -> eframe::Result<()> {
 fn demo_contacts() -> Vec<Contact> {
     vec![
         Contact {
-            name: "Алиса Морозова".into(), jid: "alisa@jabber.ru".into(), preview: "Скинула фотографии с прогулки 📸".into(), time: "12:42".into(), color: Color32::from_rgb(244, 140, 157), online: true, unread: 2,
+            name: "Алиса Морозова".into(), jid: "alisa@jabber.ru".into(), preview: "Скинула фотографии с прогулки".into(), time: "12:42".into(), color: Color32::from_rgb(244, 140, 157), online: true, unread: 2,
             messages: vec![
-                ChatMessage { body: "Привет! Как тебе вчерашний концерт?".into(), time: "12:38".into(), outgoing: false, attachment: false },
-                ChatMessage { body: "Очень понравился свет и звук. Надо будет повторить!".into(), time: "12:39".into(), outgoing: true, attachment: false },
-                ChatMessage { body: "Скинула фотографии с прогулки 📸".into(), time: "12:42".into(), outgoing: false, attachment: false },
+                ChatMessage { body: "Привет! Как тебе вчерашний концерт?".into(), time: "12:38".into(), outgoing: false, attachment: false, encrypted: false },
+                ChatMessage { body: "Очень понравился свет и звук. Надо будет повторить!".into(), time: "12:39".into(), outgoing: true, attachment: false, encrypted: false },
+                ChatMessage { body: "Скинула фотографии с прогулки".into(), time: "12:42".into(), outgoing: false, attachment: false, encrypted: false },
             ],
         },
         Contact {
             name: "Марк".into(), jid: "mark@xmpp.org".into(), preview: "Договорились, до встречи!".into(), time: "Вчера".into(), color: Color32::from_rgb(88, 168, 146), online: false, unread: 0,
-            messages: vec![ChatMessage { body: "Договорились, до встречи!".into(), time: "Вчера".into(), outgoing: false, attachment: false }],
+            messages: vec![ChatMessage { body: "Договорились, до встречи!".into(), time: "Вчера".into(), outgoing: false, attachment: false, encrypted: false }],
         },
         Contact {
-            name: "Семья 🏡".into(), jid: "family@conference.example.org".into(), preview: "Мама: В воскресенье всех жду на обед".into(), time: "Вт".into(), color: Color32::from_rgb(245, 180, 90), online: true, unread: 0,
-            messages: vec![ChatMessage { body: "Мама: В воскресенье всех жду на обед".into(), time: "Вт".into(), outgoing: false, attachment: false }],
+            name: "Семья".into(), jid: "family@conference.example.org".into(), preview: "Мама: В воскресенье всех жду на обед".into(), time: "Вт".into(), color: Color32::from_rgb(245, 180, 90), online: true, unread: 0,
+            messages: vec![ChatMessage { body: "Мама: В воскресенье всех жду на обед".into(), time: "Вт".into(), outgoing: false, attachment: false, encrypted: false }],
         },
         Contact {
             name: "Илья".into(), jid: "ilya@jabber.org".into(), preview: "Голосовое сообщение · 0:18".into(), time: "Пн".into(), color: Color32::from_rgb(126, 144, 231), online: false, unread: 0,
-            messages: vec![ChatMessage { body: "Голосовое сообщение · 0:18".into(), time: "Пн".into(), outgoing: false, attachment: true }],
+            messages: vec![ChatMessage { body: "Голосовое сообщение · 0:18".into(), time: "Пн".into(), outgoing: false, attachment: true, encrypted: false }],
         },
     ]
 }
@@ -625,6 +761,125 @@ fn avatar(ui: &mut egui::Ui, name: &str, color: Color32, size: f32, online: bool
     }
 }
 
-fn small_icon_button(ui: &mut egui::Ui, icon: &str, description: &str) {
-    ui.add(egui::Button::new(RichText::new(icon).size(20.0).color(MUTED)).corner_radius(10)).on_hover_text(description);
+#[derive(Clone, Copy)]
+enum Icon {
+    Settings,
+    Plus,
+    Search,
+    More,
+    Video,
+    Phone,
+    Lock,
+    Unlock,
+    Paperclip,
+    Send,
+    Warning,
+}
+
+fn small_icon_button(ui: &mut egui::Ui, icon: Icon, description: &str) {
+    let _ = icon_button(ui, icon, 34.0, MUTED, description);
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, color: Color32, description: &str) -> egui::Response {
+    icon_button_enabled(ui, icon, size, color, true, description)
+}
+
+fn send_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(40.0), sense);
+    let fill = if enabled { BLUE } else { Color32::from_rgb(174, 193, 224) };
+    ui.painter().rect_filled(rect, CornerRadius::same(12), fill);
+    draw_icon_in_rect(ui, Icon::Send, rect.shrink(10.0), Color32::WHITE);
+    response.on_hover_text("Отправить")
+}
+
+fn icon_button_enabled(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    size: f32,
+    color: Color32,
+    enabled: bool,
+    description: &str,
+) -> egui::Response {
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), sense);
+    if response.hovered() && enabled {
+        ui.painter().rect_filled(rect, CornerRadius::same(9), Color32::from_rgb(240, 243, 248));
+    }
+    draw_icon_in_rect(ui, icon, rect.shrink(size * 0.28), color);
+    response.on_hover_text(description)
+}
+
+fn draw_icon(ui: &mut egui::Ui, icon: Icon, size: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+    draw_icon_in_rect(ui, icon, rect.shrink(size * 0.08), color);
+}
+
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+}
+
+fn draw_icon_in_rect(ui: &egui::Ui, icon: Icon, rect: egui::Rect, color: Color32) {
+    let painter = ui.painter();
+    let stroke = Stroke::new((rect.width() / 10.0).clamp(1.4, 2.0), color);
+    let center = rect.center();
+    let x = rect.left();
+    let y = rect.top();
+    let w = rect.width();
+    let h = rect.height();
+    let p = |px: f32, py: f32| egui::pos2(x + px * w, y + py * h);
+
+    match icon {
+        Icon::Plus => {
+            painter.line_segment([p(0.5, 0.15), p(0.5, 0.85)], stroke);
+            painter.line_segment([p(0.15, 0.5), p(0.85, 0.5)], stroke);
+        }
+        Icon::More => {
+            for dx in [0.2, 0.5, 0.8] { painter.circle_filled(p(dx, 0.5), stroke.width * 1.1, color); }
+        }
+        Icon::Search => {
+            painter.circle_stroke(p(0.43, 0.42), w * 0.27, stroke);
+            painter.line_segment([p(0.63, 0.63), p(0.90, 0.90)], stroke);
+        }
+        Icon::Settings => {
+            painter.circle_stroke(center, w * 0.28, stroke);
+            painter.circle_filled(center, w * 0.08, color);
+            for angle in 0..8 {
+                let radians = angle as f32 * std::f32::consts::TAU / 8.0;
+                let direction = Vec2::new(radians.cos(), radians.sin());
+                painter.line_segment([center + direction * w * 0.35, center + direction * w * 0.48], stroke);
+            }
+        }
+        Icon::Video => {
+            painter.rect_stroke(egui::Rect::from_min_max(p(0.12, 0.25), p(0.66, 0.75)), CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            painter.add(egui::Shape::line(vec![p(0.70, 0.38), p(0.91, 0.25), p(0.91, 0.75), p(0.70, 0.62)], stroke));
+        }
+        Icon::Phone => {
+            painter.add(egui::Shape::line(vec![p(0.25, 0.12), p(0.16, 0.20), p(0.20, 0.42), p(0.35, 0.64), p(0.58, 0.80), p(0.80, 0.84), p(0.89, 0.75)], stroke));
+            painter.line_segment([p(0.18, 0.18), p(0.38, 0.38)], stroke);
+            painter.line_segment([p(0.62, 0.62), p(0.82, 0.82)], stroke);
+        }
+        Icon::Lock | Icon::Unlock => {
+            painter.rect_stroke(egui::Rect::from_min_max(p(0.20, 0.44), p(0.80, 0.91)), CornerRadius::same(3), stroke, egui::StrokeKind::Inside);
+            let shackle = if matches!(icon, Icon::Lock) {
+                vec![p(0.32, 0.46), p(0.32, 0.30), p(0.40, 0.15), p(0.60, 0.15), p(0.68, 0.30), p(0.68, 0.46)]
+            } else {
+                vec![p(0.68, 0.46), p(0.68, 0.30), p(0.60, 0.15), p(0.43, 0.15), p(0.33, 0.27)]
+            };
+            painter.add(egui::Shape::line(shackle, stroke));
+            painter.circle_filled(p(0.50, 0.64), stroke.width * 0.9, color);
+        }
+        Icon::Paperclip => {
+            painter.add(egui::Shape::line(vec![p(0.65, 0.25), p(0.35, 0.58), p(0.35, 0.72), p(0.46, 0.80), p(0.58, 0.76), p(0.79, 0.53), p(0.80, 0.40), p(0.73, 0.33), p(0.64, 0.34), p(0.43, 0.56)], stroke));
+        }
+        Icon::Send => {
+            painter.add(egui::Shape::line(vec![p(0.12, 0.18), p(0.88, 0.50), p(0.12, 0.82), p(0.28, 0.53), p(0.66, 0.50), p(0.28, 0.47), p(0.12, 0.18)], stroke));
+        }
+        Icon::Warning => {
+            painter.add(egui::Shape::line(vec![p(0.50, 0.08), p(0.94, 0.88), p(0.06, 0.88), p(0.50, 0.08)], stroke));
+            painter.line_segment([p(0.50, 0.34), p(0.50, 0.60)], stroke);
+            painter.circle_filled(p(0.50, 0.73), stroke.width * 0.75, color);
+        }
+    }
 }
