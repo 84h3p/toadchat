@@ -1,19 +1,21 @@
-use dziber_omemo::bundle::{Bundle, build_bundle_element_v0};
-use dziber_omemo::device::{Device, build_device_list_element_v0};
-use dziber_omemo::message::{EncryptedMessage, build_message_stanza};
+use crate::omemo::{Bundle, EncryptedHeader, EncryptedKey, EncryptedMessage};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use xmpp::jid::Jid;
 use xmpp::minidom::Element;
 use xmpp::parsers::iq::Iq;
 use xmpp::parsers::message::Message;
 
 const PUBSUB_NS: &str = "http://jabber.org/protocol/pubsub";
-pub const OMEMO_NS: &str = dziber_omemo::NS_OMEMO_V0;
-pub const DEVICES_NODE: &str = dziber_omemo::NS_OMEMO_V0_DEVICES;
-pub const BUNDLES_NODE: &str = dziber_omemo::NS_OMEMO_V0_BUNDLES;
+pub const OMEMO_NS: &str = "urn:xmpp:omemo:2";
+pub const DEVICES_NODE: &str = "urn:xmpp:omemo:2:devices";
+pub const BUNDLES_NODE: &str = "urn:xmpp:omemo:2:bundles";
 
 pub fn device_list_fetch_iq(jid: &str, id: &str) -> Option<Iq> {
     let target = jid.parse::<Jid>().ok()?;
-    let items = Element::builder("items", PUBSUB_NS).attr("node".try_into().expect("static attribute"), DEVICES_NODE).build();
+    let items = Element::builder("items", PUBSUB_NS)
+        .attr("node".try_into().expect("static attribute"), DEVICES_NODE)
+        .build();
     let payload = Element::builder("pubsub", PUBSUB_NS).append(items).build();
     Some(Iq::Get { from: None, to: Some(target), id: id.to_owned(), payload })
 }
@@ -21,21 +23,35 @@ pub fn device_list_fetch_iq(jid: &str, id: &str) -> Option<Iq> {
 pub fn bundle_fetch_iq(jid: &str, device_id: u32, id: &str) -> Option<Iq> {
     let target = jid.parse::<Jid>().ok()?;
     let node = format!("{BUNDLES_NODE}:{device_id}");
-    let items = Element::builder("items", PUBSUB_NS).attr("node".try_into().expect("static attribute"), node).build();
+    let items = Element::builder("items", PUBSUB_NS)
+        .attr("node".try_into().expect("static attribute"), node)
+        .build();
     let payload = Element::builder("pubsub", PUBSUB_NS).append(items).build();
     Some(Iq::Get { from: None, to: Some(target), id: id.to_owned(), payload })
 }
 
 pub fn publish_device_list_iq(jid: &str, device_id: u32, id: &str) -> Option<Iq> {
     let target = jid.parse::<Jid>().ok()?;
-    let devices = [Device { id: device_id, label: None, labelsig: None }];
-    let payload = bridge_legacy_element(&build_device_list_element_v0(&devices))?;
-    Some(publish_iq(target, id, DEVICES_NODE, "current", payload, Some("1")))
+    let device = Element::builder("device", OMEMO_NS)
+        .attr("id".try_into().expect("static attribute"), device_id.to_string())
+        .build();
+    let list = Element::builder("list", OMEMO_NS).append(device).build();
+    Some(publish_iq(target, id, DEVICES_NODE, "current", list, Some("1")))
 }
 
 pub fn publish_bundle_iq(jid: &str, bundle: &Bundle, id: &str) -> Option<Iq> {
     let target = jid.parse::<Jid>().ok()?;
-    let payload = bridge_legacy_element(&build_bundle_element_v0(bundle))?;
+    let identity = Element::builder("identity", OMEMO_NS)
+        .append(Element::builder("value", OMEMO_NS).append(hex::encode(&bundle.ik)).build())
+        .build();
+    let spk = Element::builder("signed-pre-key", OMEMO_NS)
+        .append(Element::builder("value", OMEMO_NS).append(hex::encode(&bundle.spk)).build())
+        .build();
+    let payload = Element::builder("bundle", OMEMO_NS)
+        .attr("device_id".try_into().expect("static attribute"), bundle.device_id.to_string())
+        .append(identity)
+        .append(spk)
+        .build();
     let node = format!("{BUNDLES_NODE}:{}", bundle.device_id);
     Some(publish_iq(target, id, &node, "current", payload, Some("max")))
 }
@@ -56,80 +72,104 @@ fn publish_iq(
         .attr("node".try_into().expect("static attribute"), node)
         .append(item)
         .build();
-    let mut fields = Element::builder("x", "jabber:x:data").attr("type".try_into().expect("static attribute"), "submit")
+    let mut fields = Element::builder("x", "jabber:x:data")
+        .attr("type".try_into().expect("static attribute"), "submit")
         .append(data_field("FORM_TYPE", "http://jabber.org/protocol/pubsub#publish-options", Some("hidden")));
     fields = fields.append(data_field("pubsub#access_model", "open", None));
     if let Some(max_items) = max_items {
         fields = fields.append(data_field("pubsub#max_items", max_items, None));
     }
-    let publish_options = Element::builder("publish-options", PUBSUB_NS).append(fields.build()).build();
-    let pubsub = Element::builder("pubsub", PUBSUB_NS).append(publish).append(publish_options).build();
+    let publish_options = Element::builder("publish-options", PUBSUB_NS)
+        .append(fields.build())
+        .build();
+    let pubsub = Element::builder("pubsub", PUBSUB_NS)
+        .append(publish)
+        .append(publish_options)
+        .build();
     Iq::Set { from: None, to: Some(target), id: id.to_owned(), payload: pubsub }
 }
 
 fn data_field(name: &str, value: &str, field_type: Option<&str>) -> Element {
-    let mut field = Element::builder("field", "jabber:x:data").attr("var".try_into().expect("static attribute"), name);
-    if let Some(field_type) = field_type { field = field.attr("type".try_into().expect("static attribute"), field_type); }
+    let mut field = Element::builder("field", "jabber:x:data")
+        .attr("var".try_into().expect("static attribute"), name);
+    if let Some(field_type) = field_type {
+        field = field.attr("type".try_into().expect("static attribute"), field_type);
+    }
     field.append(Element::builder("value", "jabber:x:data").append(value).build()).build()
 }
 
 pub fn parse_device_list_payload(payload: &Element) -> Option<Vec<u32>> {
     let items = payload.get_child("items", PUBSUB_NS)?;
-    items.children().filter(|item| item.name() == "item" && item.ns() == PUBSUB_NS)
-        .flat_map(|item| item.children())
-        .find_map(|element| {
-            let legacy = bridge_to_legacy_element(&element)?;
-            dziber_omemo::device::parse_device_list(&legacy)
-                .map(|list| list.devices.into_iter().map(|device| device.id).collect())
-        })
+    let mut devices = Vec::new();
+    for item in items.children().filter(|item| item.name() == "item" && item.ns() == PUBSUB_NS) {
+        if let Some(list) = item.get_child("list", OMEMO_NS) {
+            for device in list.children().filter(|device| device.name() == "device" && device.ns() == OMEMO_NS) {
+                let id = device.attr("id")?.parse::<u32>().ok()?;
+                devices.push(id);
+            }
+        }
+    }
+    if devices.is_empty() { None } else { Some(devices) }
 }
 
 pub fn parse_bundle_payload(payload: &Element, device_id: u32) -> Option<Bundle> {
     let items = payload.get_child("items", PUBSUB_NS)?;
     for item in items.children().filter(|item| item.name() == "item" && item.ns() == PUBSUB_NS) {
-        for element in item.children() {
-            let Some(mut bundle) = dziber_omemo::bundle::parse_bundle(&bridge_to_legacy_element(&element)?) else { continue; };
-            bundle.device_id = device_id;
-            return Some(bundle);
+        if let Some(bundle) = item.get_child("bundle", OMEMO_NS) {
+            let identity = bundle.get_child("identity", OMEMO_NS)?.text();
+            let spk = bundle.get_child("signed-pre-key", OMEMO_NS)?.text();
+            let ik = hex::decode(identity).ok()?;
+            let spk = hex::decode(spk).ok()?;
+            return Some(Bundle { device_id, ik, spk, opk: vec![] });
         }
     }
     None
 }
 
 pub fn encrypted_message_element(message: &EncryptedMessage, to: &str, id: &str) -> Option<Message> {
-    let stanza = build_message_stanza(to, message, id, None);
-    let modern = bridge_legacy_element(&stanza)?;
-    Message::try_from(modern).ok()
+    let mut encrypted = Element::builder("encrypted", OMEMO_NS);
+    let header = Element::builder("header", OMEMO_NS)
+        .attr("sid".try_into().expect("static attribute"), message.header.sid.to_string());
+    let mut header = header;
+    for key in &message.header.keys {
+        let key_element = Element::builder("key", OMEMO_NS)
+            .attr("rid".try_into().expect("static attribute"), key.rid.to_string())
+            .attr("kex".try_into().expect("static attribute"), key.kex.to_string())
+            .append(STANDARD.encode(&key.data))
+            .build();
+        header = header.append(key_element);
+    }
+    let payload = Element::builder("payload", OMEMO_NS)
+        .append(STANDARD.encode(&message.payload))
+        .build();
+    encrypted = encrypted.append(header.build()).append(payload);
+    let stanza = Element::builder("message", "jabber:client")
+        .attr("to".try_into().expect("static attribute"), to)
+        .attr("id".try_into().expect("static attribute"), id)
+        .append(encrypted.build())
+        .build();
+    Message::try_from(stanza).ok()
 }
 
-pub fn encrypted_payload(message: &Message) -> Option<dziber_omemo::message::EncryptedMessage> {
+pub fn encrypted_payload(message: &Message) -> Option<EncryptedMessage> {
     let element = message.payloads.iter().find(|payload| payload.name() == "encrypted" && payload.ns() == OMEMO_NS)?;
-    dziber_omemo::message::parse_encrypted_message(&bridge_to_legacy_element(element)?)
-}
-
-fn bridge_legacy_element(element: &legacy_minidom::Element) -> Option<Element> {
-    let mut bytes = Vec::new();
-    element.write_to(&mut bytes).ok()?;
-    let xml = String::from_utf8(bytes).ok()?;
-    xml.parse().ok()
-}
-
-fn bridge_to_legacy_element(element: &Element) -> Option<legacy_minidom::Element> {
-    let mut bytes = Vec::new();
-    element.write_to(&mut bytes).ok()?;
-    let xml = String::from_utf8(bytes).ok()?;
-    xml.parse().ok()
-}
-
-// dziber-omemo 0.0.3 depends on minidom 0.18 while xmpp-rs uses 0.19.
-mod legacy_minidom {
-    pub use ::minidom_legacy::Element;
+    let header = element.get_child("header", OMEMO_NS)?;
+    let sid = header.attr("sid")?.parse::<u32>().ok()?;
+    let mut keys = Vec::new();
+    for key in header.children().filter(|key| key.name() == "key" && key.ns() == OMEMO_NS) {
+        let rid = key.attr("rid")?.parse::<u32>().ok()?;
+        let data = STANDARD.decode(key.text()).ok()?;
+        let kex = key.attr("kex").map(|value| value == "true").unwrap_or(false);
+        keys.push(EncryptedKey { rid, data, kex });
+    }
+    let payload_text = element.get_child("payload", OMEMO_NS)?.text();
+    let payload = STANDARD.decode(&payload_text).ok().unwrap_or_else(|| payload_text.into_bytes());
+    Some(EncryptedMessage { header: EncryptedHeader { sid, keys }, payload })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dziber_omemo::store::MemoryStore;
 
     #[test]
     fn device_fetch_is_targeted_to_bare_jid() {
@@ -148,22 +188,21 @@ mod tests {
     }
 
     #[test]
-    fn publishes_conversations_legacy_device_and_bundle_nodes() {
-        let manager = dziber_omemo::OmemoManager::generate(7, Box::new(MemoryStore::new()));
+    fn publishes_omemo2_device_and_bundle_nodes() {
+        let bundle = crate::omemo::Bundle {
+            device_id: 7,
+            ik: vec![0x11, 0x22, 0x33],
+            spk: vec![0x44, 0x55, 0x66],
+            opk: vec![],
+        };
         let device_iq = publish_device_list_iq("me@example.org", 7, "device-publish").unwrap();
         let Iq::Set { payload: devices_payload, .. } = device_iq else { panic!("expected set IQ") };
         let publish = devices_payload.get_child("publish", PUBSUB_NS).unwrap();
-        assert_eq!(publish.attr("node"), Some(dziber_omemo::NS_OMEMO_V0_DEVICES));
-        let item = publish.get_child("item", PUBSUB_NS).unwrap();
-        assert!(item.get_child("list", dziber_omemo::NS_OMEMO_V0).is_some());
-
-        let bundle = manager.self_bundle().unwrap();
+        assert_eq!(publish.attr("node"), Some(DEVICES_NODE));
         let bundle_iq = publish_bundle_iq("me@example.org", &bundle, "bundle-publish").unwrap();
         let Iq::Set { payload: bundle_payload, .. } = bundle_iq else { panic!("expected set IQ") };
         let publish = bundle_payload.get_child("publish", PUBSUB_NS).unwrap();
-        let expected_bundle_node = format!("{}:7", dziber_omemo::NS_OMEMO_V0_BUNDLES);
+        let expected_bundle_node = format!("{BUNDLES_NODE}:7");
         assert_eq!(publish.attr("node"), Some(expected_bundle_node.as_str()));
-        let item = publish.get_child("item", PUBSUB_NS).unwrap();
-        assert!(item.get_child("bundle", dziber_omemo::NS_OMEMO_V0).is_some());
     }
 }

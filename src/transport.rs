@@ -13,11 +13,9 @@ use xmpp::tokio_xmpp::Stanza;
 use xmpp::{ClientBuilder, Event};
 use sha2::Digest;
 
+use crate::omemo::{Bundle, OmemoManager, TrustStatus};
 use crate::omemo_protocol;
 use crate::omemo_store::PersistentOmemoStore;
-use dziber_omemo::manager::OmemoManager;
-use dziber_omemo::bundle::Bundle;
-use dziber_omemo::trust::TrustStatus;
 
 static IQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -182,7 +180,7 @@ async fn run_async(
                         };
                         if encrypted {
                             if !is_direct_chat_jid(&recipient_bare) {
-                                emit(&events, &repaint, ClientEvent::Info("Экспериментальный legacy OMEMO разрешён только для личных чатов".to_owned()));
+                                emit(&events, &repaint, ClientEvent::Info("OMEMO 2 разрешён только для личных чатов".to_owned()));
                                 continue;
                             }
                             let Some(manager) = omemo.as_mut() else {
@@ -394,7 +392,7 @@ async fn process_omemo_iq(
                 return;
             };
             let fingerprint = fingerprint(&bundle.ik);
-            let pinned_identity = manager.bundle_cache.get(&jid).and_then(|devices| devices.get(&device_id)).map(|cached| cached.identity_key);
+            let pinned_identity = manager.bundle_cache.get(&jid).and_then(|devices| devices.get(&device_id)).map(|cached| cached.identity_key.clone());
             if pinned_identity.is_some_and(|pinned| pinned.as_slice() != bundle.ik.as_slice()) {
                 manager.trust_store.set(&jid, device_id, TrustStatus::Untrusted);
                 pending_bundles.insert((jid.clone(), device_id), bundle);
@@ -439,22 +437,23 @@ async fn process_encrypted_message(
         emit(events, repaint, ClientEvent::OmemoBlocked { sender: sender.to_owned(), reason: format!("устройство {} не проверено; текст не показан", encrypted.header.sid) });
         return;
     }
-    if let Some(key) = encrypted.header.keys.iter().flat_map(|group| &group.keys)
-        .find(|key| key.rid == manager.our_device_id() && key.kex)
-    {
-        let claimed_identity = key.data.get(1..)
-            .and_then(|bytes| dziber_omemo::signal_ratchet::proto::PreKeySignalMessage::decode(bytes).ok())
-            .map(|prekey| prekey.identity_key);
-        let pinned_identity = manager.bundle_cache.get(sender)
-            .and_then(|bundles| bundles.get(&encrypted.header.sid))
-            .map(|bundle| bundle.identity_key);
-        if claimed_identity.is_none() || claimed_identity != pinned_identity {
-            emit(events, repaint, ClientEvent::OmemoBlocked {
-                sender: sender.to_owned(),
-                reason: "PreKey identity не совпадает с проверенным bundle fingerprint; сообщение заблокировано".to_owned(),
-            });
-            return;
-        }
+    let Some(key) = encrypted.header.keys.iter().find(|key| key.rid == manager.our_device_id() && key.kex) else {
+        emit(events, repaint, ClientEvent::OmemoBlocked {
+            sender: sender.to_owned(),
+            reason: "ОМЕМО-ключи для текущего устройства отсутствуют; сообщение заблокировано".to_owned(),
+        });
+        return;
+    };
+    let claimed_identity = if key.data.is_empty() { None } else { Some(key.data.clone()) };
+    let pinned_identity = manager.bundle_cache.get(sender)
+        .and_then(|bundles| bundles.get(&encrypted.header.sid))
+        .map(|bundle| bundle.identity_key.clone());
+    if claimed_identity.is_none() || claimed_identity != pinned_identity {
+        emit(events, repaint, ClientEvent::OmemoBlocked {
+            sender: sender.to_owned(),
+            reason: "PreKey identity не совпадает с проверенным bundle fingerprint; сообщение заблокировано".to_owned(),
+        });
+        return;
     }
     match manager.decrypt_message(sender, &encrypted) {
         Some(body) => {
@@ -492,7 +491,7 @@ fn trust_status(manager: &OmemoManager, jid: &str, device_id: u32) -> DeviceTrus
 }
 
 fn fingerprint_for(manager: &OmemoManager, jid: &str, device_id: u32) -> Option<String> {
-    let identity = manager.bundle_cache.get(jid)?.get(&device_id)?.identity_key;
+    let identity = manager.bundle_cache.get(jid)?.get(&device_id)?.identity_key.clone();
     Some(fingerprint(&identity))
 }
 
@@ -517,12 +516,16 @@ fn emit(events: &Sender<ClientEvent>, repaint: &Context, event: ClientEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dziber_omemo::store::MemoryStore;
-
     #[test]
-    fn experimental_omemo_v0_encrypts_and_decrypts_between_devices() {
-        let mut alice = OmemoManager::generate(101, Box::new(MemoryStore::new()));
-        let mut bob = OmemoManager::generate(202, Box::new(MemoryStore::new()));
+    fn omemo2_encrypts_and_decrypts_between_devices() {
+        let mut alice = OmemoManager::load_or_generate(101, Box::new(crate::omemo_store::PersistentOmemoStore {
+            path: std::env::temp_dir().join(format!("toadchat-omemo-{}-alice.sqlite3", std::process::id())),
+            pickle_key: [0x42; 32],
+        }));
+        let mut bob = OmemoManager::load_or_generate(202, Box::new(crate::omemo_store::PersistentOmemoStore {
+            path: std::env::temp_dir().join(format!("toadchat-omemo-{}-bob.sqlite3", std::process::id())),
+            pickle_key: [0x43; 32],
+        }));
         alice.set_our_jid("alice@example.org");
         bob.set_our_jid("bob@example.org");
 
@@ -537,8 +540,6 @@ mod tests {
             .expect("build OMEMO XMPP stanza");
         let parsed = omemo_protocol::encrypted_payload(&stanza).expect("parse OMEMO XMPP stanza");
         assert_eq!(bob.decrypt_message("alice@example.org", &parsed).as_deref(), Some("secret test body"));
-
-        // The sender's bundle is only used to ensure the generated identities are valid and distinct.
         assert_ne!(alice_bundle.ik, bob_bundle.ik);
     }
 }

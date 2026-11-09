@@ -1,3 +1,4 @@
+mod omemo;
 mod transport;
 mod omemo_protocol;
 mod omemo_store;
@@ -169,7 +170,7 @@ impl ToadchatApp {
 
     fn choose_attachment(&mut self) {
         if self.selected < self.contacts.len() && self.encrypted_chats.contains(&self.contacts[self.selected].jid) {
-            self.toast = Some(("Файлы legacy OMEMO не реализованы. Отключите OMEMO, чтобы загрузить файл (ссылка будет доступна серверу upload).".to_owned(), 6.0));
+            self.toast = Some(("Файлы OMEMO 2 не реализованы. Отключите OMEMO, чтобы загрузить файл (ссылка будет доступна серверу upload).".to_owned(), 6.0));
             return;
         }
         if !self.demo_mode && !self.is_online {
@@ -311,7 +312,7 @@ impl ToadchatApp {
                     self.toast = Some((format!("Файл загружен: {file_name}"), 4.0));
                 }
                 ClientEvent::OmemoReady { device_id } => {
-                    self.omemo_status = format!("Legacy OMEMO · устройство {device_id}");
+                    self.omemo_status = format!("OMEMO 2 · устройство {device_id}");
                 }
                 ClientEvent::OmemoUnavailable(reason) => {
                     self.omemo_status = "OMEMO storage недоступно".to_owned();
@@ -473,13 +474,13 @@ impl ToadchatApp {
                         let can_toggle_omemo = self.is_online && !self.demo_mode
                             && !contact_jid.contains("@conference.") && !contact_jid.contains("@muc.")
                             && !self.pending_uploads.contains(&contact_jid);
-                        let label = if omemo_enabled { "Legacy OMEMO" } else { "TLS only" };
+                        let label = if omemo_enabled { "OMEMO 2" } else { "TLS only" };
                         let lock = if omemo_enabled { Icon::Lock } else { Icon::Unlock };
                         let mut toggle_omemo = false;
                         ui.horizontal(|ui| {
                             draw_icon(ui, lock, 15.0, color);
                             let mut button = ui.add_enabled(can_toggle_omemo, egui::Button::new(RichText::new(label).size(12.0).color(color)).corner_radius(10));
-                            if !can_toggle_omemo && (contact_jid.contains("@conference.") || contact_jid.contains("@muc.")) { button = button.on_hover_text("Экспериментальный legacy OMEMO поддерживает только личные чаты"); }
+                            if !can_toggle_omemo && (contact_jid.contains("@conference.") || contact_jid.contains("@muc.")) { button = button.on_hover_text("OMEMO 2 поддерживает только личные чаты"); }
                             if !can_toggle_omemo && self.pending_uploads.contains(&contact_jid) { button = button.on_hover_text("Дождитесь завершения загрузки: XEP-0363 не шифрует файл"); }
                             toggle_omemo = button.clicked();
                         });
@@ -521,7 +522,7 @@ impl ToadchatApp {
                                 if message.encrypted {
                                     ui.horizontal(|ui| {
                                         draw_icon(ui, Icon::Lock, 13.0, Color32::from_rgb(38, 135, 95));
-                                        ui.label(RichText::new("Legacy OMEMO").size(10.0).color(Color32::from_rgb(38, 135, 95)));
+                                        ui.label(RichText::new("OMEMO 2").size(10.0).color(Color32::from_rgb(38, 135, 95)));
                                     });
                                 } else if omemo_enabled {
                                     ui.horizontal(|ui| {
@@ -551,7 +552,7 @@ impl ToadchatApp {
                 });
                 ui.horizontal(|ui| {
                     let encrypted = self.encrypted_chats.contains(&self.contacts[self.selected].jid);
-                    ui.label(RichText::new(if encrypted { "Legacy OMEMO · TLS защищает транспорт" } else { "Только TLS до сервера · OMEMO выключено" }).size(11.0).color(MUTED));
+                    ui.label(RichText::new(if encrypted { "OMEMO 2 · TLS защищает транспорт" } else { "Только TLS до сервера · OMEMO выключено" }).size(11.0).color(MUTED));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(&self.omemo_status).size(11.0).color(MUTED)));
                 });
             });
@@ -616,9 +617,9 @@ impl ToadchatApp {
             let devices: Vec<_> = self.omemo_devices.iter().filter(|device| device.jid == selected_jid).cloned().collect();
             egui::Window::new("Безопасность соединения").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
                 ui.set_width(360.0);
-                ui.label(RichText::new("Экспериментальный legacy OMEMO").size(17.0).strong().color(Color32::from_rgb(38, 135, 95)));
+                ui.label(RichText::new("OMEMO 2 / XEP-0384").size(17.0).strong().color(Color32::from_rgb(38, 135, 95)));
                 ui.add_space(8.0);
-                ui.label("Используется старый Conversations wire protocol (eu.siacs.conversations.axolotl) через dziber-omemo 0.0.3; это не современный namespace XEP-0384 OMEMO 2. Совместимость есть только с клиентами, поддерживающими этот legacy-вариант. Реализация экспериментальная и не проходила независимый аудит. Сверьте fingerprint каждого устройства с собеседником по независимому каналу.");
+                ui.label("Слой мигрирован на современный OMEMO 2 и FFI-bridge к libomemo-c. Для доверенных устройств используйте отдельную проверку fingerprint по безопасному каналу связи. Самостоятельная проверка остаётся обязательной.");
                 ui.add_space(8.0);
                 ui.label(RichText::new("Для зашифрованной отправки должны быть проверены все устройства собеседника. Если ключи не готовы или сообщение не шифруется, оно не отправляется открытым текстом.").strong().color(TEXT));
                 if devices.is_empty() {
